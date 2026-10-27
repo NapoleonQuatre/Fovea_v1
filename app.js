@@ -1,9 +1,19 @@
 /* ==========================================================================
-   Fovea — lecteur RSVP (JavaScript vanilla, aucune dépendance)
+   Fovea — lecteur RSVP (JavaScript vanilla)
 
    1. Cœur pur : tokenisation, poids de pause, calcul de l'ORP, mise à l'échelle.
       Ces fonctions n'utilisent pas le DOM (elles sont testées sous Node).
    2. Interface : lecture, contrôles, progression, clavier, molette.
+   3. Voix : dictée optionnelle par Piper (VITS en WebAssembly, exécutée dans le
+      navigateur via la librairie @mintplex-labs/piper-tts-web, chargée à la
+      demande). Quand la voix est active, c'est l'horloge audio qui commande
+      l'affichage : le texte est découpé en segments d'environ une phrase,
+      chaque segment est synthétisé séparément, et sa durée réelle sert
+      d'échelle de temps. Les mots du segment sont répartis sur cette durée
+      proportionnellement à leurs poids de pause : la synchro est exacte à
+      chaque frontière de phrase. La vitesse agit sur la voix par un facteur
+      ×0,5 à ×2 (300 mots/min = ×1) ; le curseur WPM garde son sens exact
+      en mode muet.
    ========================================================================== */
 (() => {
   'use strict';
@@ -166,465 +176,6 @@
     return Math.round(Math.max(12, Math.min(baseFs, maxFs)) * 10) / 10;
   }
 
-  /* ---- Voix : découpage du texte en phrases à dicter ----
-     Chaque morceau est dicté d'un seul souffle (intonation naturelle). On garde,
-     pour chaque mot affiché, sa position (offset) dans le texte dicté : c'est
-     ce qui relie ce que la voix prononce à ce que l'écran affiche. */
-  const VOICE_MIN_WORDS = 6;      // phrases plus longues : l'intonation d'une voix neuronale y est meilleure
-  const VOICE_COMMA_WORDS = 14;
-  const VOICE_MAX_WORDS = 26;
-
-  const VOICE_LIMITS = { min: VOICE_MIN_WORDS, comma: VOICE_COMMA_WORDS, max: VOICE_MAX_WORDS };
-
-  function voiceChunk(words, start, limits = VOICE_LIMITS) {
-    let text = '';
-    const offsets = [];
-    let end = start;
-    for (let i = start; i < words.length; i++) {
-      const w = words[i];
-      if (i > start && !w.j) text += ' ';
-      offsets.push(text.length);
-      text += w.t;
-      end = i;
-      const next = words[i + 1];
-      if (next && next.j) continue;                    // jamais au milieu d'un mot coupé
-      const count = i - start + 1;
-      const bare = w.t.replace(CLOSERS, '');
-      if (w.p) break;
-      if (count >= limits.min && /[.!?…;:]$/.test(bare)) break;
-      if (count >= limits.comma && /[,–—]$/.test(bare)) break;
-      if (count >= limits.max) break;
-    }
-    return { start, end, text, offsets };
-  }
-
-  /* Heure de début (en secondes) de chaque mot, d'après l'alignement par
-     caractère renvoyé par ElevenLabs. Si le nombre de caractères alignés
-     diffère du texte envoyé (normalisation), on se rabat sur une position
-     proportionnelle. Le résultat est toujours croissant. */
-  function wordTimes(offsets, textLen, starts) {
-    const n = starts ? starts.length : 0;
-    if (!n) return offsets.map(() => 0);
-    const out = [];
-    let prev = 0;
-    for (const o of offsets) {
-      const idx = n === textLen ? o : Math.min(n - 1, Math.round((o / Math.max(1, textLen)) * n));
-      const t = Math.max(prev, Number(starts[idx]) || 0);
-      out.push(t);
-      prev = t;
-    }
-    return out;
-  }
-
-  /* Indice du mot qui contient la position `pos` (plus grand offset <= pos). */
-  function locateOffset(offsets, pos) {
-    let lo = 0;
-    let hi = offsets.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (offsets[mid] <= pos) lo = mid; else hi = mid - 1;
-    }
-    return lo;
-  }
-
-  /* ---- Voix neuronales : placer chaque mot dans l'enregistrement ----
-     Les moteurs Piper et MeloTTS renvoient un enregistrement, pas des évènements
-     « mot ». On retrouve donc la position de chaque mot dans l'audio :
-       1. on mesure l'énergie du signal pour trouver le début et la fin de la parole
-          et les silences intérieurs (virgules, respirations) ;
-       2. on pèse chaque mot (syllabes, lettres) et on estime où il tombe ;
-       3. chaque silence réel est rattaché à la frontière de mots la plus proche
-          (de préférence une ponctuation) : ces silences servent d'ancres exactes ;
-       4. entre deux ancres, les mots sont répartis selon leur poids.
-     L'écran suit ensuite l'horloge audio : aucune dérive ne s'accumule. */
-
-  const VOWELS = 'aeiouyàâäéèêëîïôöùûüÿœæ';
-  const ALIGN_HOP = 0.01;             // pas d'analyse : 10 ms
-  const ALIGN_WIN = 0.025;            // fenêtre : 25 ms
-  const ALIGN_MIN_PAUSE = 0.09;       // silence minimal retenu comme pause : 90 ms
-
-  function syllableCount(word) {
-    const w = word.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
-    if (!w) return 1;
-    if (/^\p{N}+$/u.test(w)) return Math.max(1, w.length * 0.9);       // nombres : lus chiffre à chiffre ou en groupes
-    let count = 0;
-    let inVowel = false;
-    for (const ch of w) {
-      const v = VOWELS.includes(ch);
-      if (v && !inVowel) count++;
-      inVowel = v;
-    }
-    // « e » muet final (table, tables, parlent) : pas de syllabe en plus
-    if (count > 1 && /[^aeiouyàâäéèêëîïôöùûüÿœæ](e|es|ent)$/.test(w)) count--;
-    return Math.max(1, count);
-  }
-
-  function wordWeight(word) {
-    const letters = Array.from(word.replace(/[^\p{L}\p{N}]/gu, '')).length;
-    return 0.9 * syllableCount(word) + 0.1 * letters + 0.25;
-  }
-
-  /* Poids d'une pause attendue après ce mot, d'après sa ponctuation finale. */
-  function pauseWeight(word) {
-    const bare = word.replace(CLOSERS, '');
-    if (SENTENCE_END.test(bare)) return 1.6;
-    if (/[;:]$/.test(bare)) return 1.1;
-    if (/[,–—]$/.test(bare)) return 0.9;
-    return 0;
-  }
-
-  function frameRms(samples, sr) {
-    const hop = Math.max(1, Math.round(sr * ALIGN_HOP));
-    const win = Math.max(hop, Math.round(sr * ALIGN_WIN));
-    const frames = Math.max(0, Math.floor((samples.length - win) / hop) + 1);
-    const rms = new Float32Array(frames);
-    for (let f = 0; f < frames; f++) {
-      let sum = 0;
-      const from = f * hop;
-      for (let i = from; i < from + win; i++) sum += samples[i] * samples[i];
-      rms[f] = Math.sqrt(sum / win);
-    }
-    return { rms, hop, win };
-  }
-
-  /* Début/fin de la parole et silences intérieurs d'un enregistrement. Temps en secondes. */
-  function analyzeSpeech(samples, sr) {
-    const { rms, hop, win } = frameRms(samples, sr);
-    const total = samples.length / sr;
-    if (!rms.length) return { start: 0, end: total, pauses: [], total };
-    let peak = 0;
-    for (const v of rms) if (v > peak) peak = v;
-    const sorted = Array.from(rms).sort((a, b) => a - b);
-    const floor = sorted[Math.floor(sorted.length * 0.1)];
-    const thr = Math.max(peak * 0.04, floor * 2.5, 1e-4);
-    const at = (f) => (f * hop + win / 2) / sr;                 // centre de la trame
-    let first = 0;
-    while (first < rms.length && rms[first] <= thr) first++;
-    let last = rms.length - 1;
-    while (last > first && rms[last] <= thr) last--;
-    if (first >= rms.length) return { start: 0, end: total, pauses: [], total };
-    const pauses = [];
-    let f = first;
-    while (f <= last) {
-      if (rms[f] > thr) { f++; continue; }
-      let g = f;
-      while (g <= last && rms[g] <= thr) g++;
-      const s = at(f - 1) + hop / sr / 2;
-      const e = at(g) - hop / sr / 2;
-      if (e - s >= ALIGN_MIN_PAUSE) pauses.push({ s, e, c: (s + e) / 2 });
-      f = g;
-    }
-    return {
-      start: Math.max(0, at(first) - 0.03),
-      end: Math.min(total, at(last) + 0.03),
-      pauses,
-      total
-    };
-  }
-
-  /* Instant de début de chaque mot, en secondes depuis le début de l'enregistrement.
-     `words` : textes affichés ; `info` : résultat de analyzeSpeech. */
-  function alignWords(words, info) {
-    const n = words.length;
-    const starts = new Array(n).fill(info.start);
-    if (n < 2) return starts;
-    const dur = Math.max(0.05, info.end - info.start);
-    const w = words.map(wordWeight);
-    const p = words.map((t, i) => (i < n - 1 ? pauseWeight(t) : 0));
-
-    // 1. position estimée du milieu de chaque frontière (après le mot i)
-    let total = 0;
-    for (let i = 0; i < n; i++) total += w[i] + p[i];
-    const mid = new Array(n - 1);
-    let acc = 0;
-    for (let i = 0; i < n - 1; i++) {
-      acc += w[i];
-      mid[i] = info.start + ((acc + p[i] / 2) / total) * dur;
-      acc += p[i];
-    }
-
-    // 2. rattacher chaque silence réel à une frontière, dans l'ordre
-    const matched = [];                                   // { b: frontière, pause }
-    let lastB = -1;
-    const tol = 0.22 * dur + 0.15;
-    for (const pause of info.pauses) {
-      let best = -1;
-      let bestCost = Infinity;
-      for (let b = lastB + 1; b < n - 1; b++) {
-        const d = Math.abs(mid[b] - pause.c);
-        if (d > tol) { if (mid[b] > pause.c) break; continue; }
-        const cost = d / dur + (p[b] > 0 ? 0 : 0.06);
-        if (cost < bestCost) { bestCost = cost; best = b; }
-      }
-      if (best >= 0) { matched.push({ b: best, pause }); lastB = best; }
-    }
-
-    // 3. répartir les mots entre ancres selon leur poids
-    let segFirst = 0;
-    let segStart = info.start;
-    for (let m = 0; m <= matched.length; m++) {
-      const lastWord = m < matched.length ? matched[m].b : n - 1;
-      const segEnd = m < matched.length ? matched[m].pause.s : info.end;
-      let sum = 0;
-      for (let i = segFirst; i <= lastWord; i++) sum += w[i] + (i < lastWord ? p[i] : 0);
-      const span = Math.max(0.02, segEnd - segStart);
-      let cum = 0;
-      for (let i = segFirst; i <= lastWord; i++) {
-        starts[i] = segStart + (cum / sum) * span;
-        cum += w[i] + (i < lastWord ? p[i] : 0);
-      }
-      if (m < matched.length) { segFirst = lastWord + 1; segStart = matched[m].pause.e; }
-    }
-    for (let i = 1; i < n; i++) if (starts[i] < starts[i - 1]) starts[i] = starts[i - 1];
-    return starts;
-  }
-
-  /* Indice du dernier mot dont l'instant de début est <= t. */
-  function wordAtTime(starts, t) {
-    let lo = 0;
-    let hi = starts.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1;
-      if (starts[mid] <= t) lo = mid; else hi = mid - 1;
-    }
-    return lo;
-  }
-
-  /* ---- Audio : lecture et écriture de fichiers WAV, préparation d'un clip ---- */
-
-  /* WAV (PCM 8/16/24/32 bits ou flottant 32 bits, mono ou stéréo) -> { samples (mono, -1..1), sr }. */
-  function parseWav(buf) {
-    const dv = new DataView(buf);
-    if (dv.byteLength < 44 || dv.getUint32(0) !== 0x52494646 || dv.getUint32(8) !== 0x57415645) return null;
-    let pos = 12;
-    let fmt = null;
-    let data = null;
-    while (pos + 8 <= dv.byteLength) {
-      const id = dv.getUint32(pos);
-      const size = dv.getUint32(pos + 4, true);
-      if (id === 0x666d7420) {
-        fmt = { tag: dv.getUint16(pos + 8, true), ch: dv.getUint16(pos + 10, true), sr: dv.getUint32(pos + 12, true), bits: dv.getUint16(pos + 22, true) };
-        if (fmt.tag === 0xfffe && size >= 40) fmt.tag = dv.getUint16(pos + 32, true);   // format étendu : le vrai code est dans le sous-format
-      } else if (id === 0x64617461) {
-        data = { off: pos + 8, size: Math.min(size, dv.byteLength - pos - 8) };
-        break;
-      }
-      pos += 8 + size + (size & 1);
-    }
-    if (!fmt || !data || !fmt.ch || !fmt.bits) return null;
-    const bytes = fmt.bits / 8;
-    const frames = Math.floor(data.size / (bytes * fmt.ch));
-    const samples = new Float32Array(frames);
-    const isFloat = fmt.tag === 3;
-    for (let i = 0; i < frames; i++) {
-      let sum = 0;
-      for (let c = 0; c < fmt.ch; c++) {
-        const o = data.off + (i * fmt.ch + c) * bytes;
-        let v;
-        if (isFloat && fmt.bits === 32) v = dv.getFloat32(o, true);
-        else if (fmt.bits === 16) v = dv.getInt16(o, true) / 32768;
-        else if (fmt.bits === 24) v = ((dv.getUint8(o) | (dv.getUint8(o + 1) << 8) | (dv.getInt8(o + 2) << 16)) / 8388608);
-        else if (fmt.bits === 32) v = dv.getInt32(o, true) / 2147483648;
-        else if (fmt.bits === 8) v = (dv.getUint8(o) - 128) / 128;
-        else return null;
-        sum += v;
-      }
-      samples[i] = sum / fmt.ch;
-    }
-    return { samples, sr: fmt.sr };
-  }
-
-  /* Échantillons (-1..1) -> fichier WAV PCM 16 bits mono. */
-  function encodeWav(samples, sr) {
-    const n = samples.length;
-    const buf = new ArrayBuffer(44 + n * 2);
-    const dv = new DataView(buf);
-    const str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
-    str(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
-    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
-    dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
-    str(36, 'data'); dv.setUint32(40, n * 2, true);
-    for (let i = 0; i < n; i++) {
-      const v = Math.max(-1, Math.min(1, samples[i]));
-      dv.setInt16(44 + i * 2, v < 0 ? v * 32768 : v * 32767, true);
-    }
-    return buf;
-  }
-
-  /* Même niveau sonore d'une phrase à l'autre : le pic est ramené à `target`. */
-  function normalizePeak(samples, target) {
-    let peak = 0;
-    for (let i = 0; i < samples.length; i++) { const a = Math.abs(samples[i]); if (a > peak) peak = a; }
-    const gain = target / Math.max(peak, 0.05);
-    if (gain !== 1) for (let i = 0; i < samples.length; i++) samples[i] *= gain;
-    return samples;
-  }
-
-  const CLIP_PAD = { stop: 0.32, clause: 0.16, none: 0.04, paragraph: 0.28 };
-
-  /* Un enregistrement + le texte de la phrase -> clip prêt à jouer :
-     silences de début et de fin retirés, pause finale choisie d'après la ponctuation
-     (elle est la même quelle que soit la voix), et début de chaque mot dans le clip. */
-  function prepareClip(wordTexts, lastIsParagraphEnd, samples, sr) {
-    const info = analyzeSpeech(samples, sr);
-    const starts = alignWords(wordTexts, info);
-    const from = Math.max(0, info.start - 0.04);
-    const to = Math.min(info.total, info.end + 0.04);
-    const last = wordTexts[wordTexts.length - 1] || '';
-    const bare = last.replace(CLOSERS, '');
-    let pad = SENTENCE_END.test(bare) ? CLIP_PAD.stop : /[;:,–—]$/.test(bare) ? CLIP_PAD.clause : CLIP_PAD.none;
-    if (lastIsParagraphEnd) pad += CLIP_PAD.paragraph;
-    const a = Math.round(from * sr);
-    const b = Math.max(a + 1, Math.round(to * sr));
-    const out = new Float32Array(b - a + Math.round(pad * sr));
-    out.set(samples.subarray(a, Math.min(b, samples.length)), 0);
-    const fade = Math.min(Math.round(0.006 * sr), Math.floor((b - a) / 4));
-    for (let i = 0; i < fade; i++) {
-      const g = i / fade;
-      out[i] *= g;
-      out[b - a - 1 - i] *= g;
-    }
-    return {
-      wav: encodeWav(out, sr),
-      wordT: starts.map((t) => Math.max(0, t - from)),
-      dur: out.length / sr
-    };
-  }
-
-  /* ---- Voix neuronales : calage des mots sur l'audio ----
-     Un moteur comme Piper ou MeloTTS rend un fichier audio par phrase, sans dire
-     quand chaque mot est prononcé. On le retrouve en deux temps :
-       1. on mesure l'audio : début et fin réels de la parole, et les silences
-          à l'intérieur (virgules, points) ;
-       2. on répartit les mots entre ces repères au prorata de leur durée
-          probable (nombre de phonèmes), puis on recale sur chaque silence
-          détecté qui correspond à une ponctuation du texte.
-     La précision vient donc de l'audio lui-même, pas d'une estimation de débit. */
-
-  const PAUSE_UNITS = { strong: 5, medium: 3.5, weak: 2.5 };
-  const MIN_PAUSE_S = 0.11;       // en dessous, c'est une occlusive (p, t, k), pas une pause
-  const SPEECH_PAD_S = 0.012;
-
-  /* Type de pause après un mot, d'après sa ponctuation. */
-  function boundaryKind(token) {
-    const t = String(token).replace(CLOSERS, '');
-    if (/(\.{2,}|…|[.!?])$/.test(t)) return 'strong';
-    if (/[;:]$/.test(t)) return 'medium';
-    if (/[,–—]$/.test(t)) return 'weak';
-    return null;
-  }
-
-  /* Début et fin de la parole, et silences internes (en secondes). */
-  function analyzeAudio(pcm, sampleRate) {
-    const hop = Math.max(1, Math.round(sampleRate * 0.01));
-    const nFrames = Math.floor(pcm.length / hop);
-    const duration = pcm.length / sampleRate;
-    if (nFrames < 3) return { duration, start: 0, end: duration, pauses: [], threshold: 0 };
-    const rms = new Float32Array(nFrames);
-    for (let f = 0; f < nFrames; f++) {
-      let sum = 0;
-      for (let i = f * hop, e = i + hop; i < e; i++) sum += pcm[i] * pcm[i];
-      rms[f] = Math.sqrt(sum / hop);
-    }
-    const sorted = Float32Array.from(rms).sort();
-    const peak = sorted[Math.floor(0.97 * (nFrames - 1))];
-    const floor = sorted[Math.floor(0.1 * (nFrames - 1))];
-    const threshold = Math.max(peak * 0.05, floor * 3, 1e-4);
-    const frameS = hop / sampleRate;
-    let first = 0;
-    while (first < nFrames && rms[first] < threshold) first++;
-    let last = nFrames - 1;
-    while (last > first && rms[last] < threshold) last--;
-    if (first >= nFrames) return { duration, start: 0, end: duration, pauses: [], threshold };
-    const pauses = [];
-    const minFrames = Math.ceil(MIN_PAUSE_S / frameS);
-    let run = -1;
-    for (let f = first; f <= last + 1; f++) {
-      const quiet = f <= last && rms[f] < threshold;
-      if (quiet && run < 0) run = f;
-      if (!quiet && run >= 0) {
-        if (f - run >= minFrames) pauses.push({ t0: run * frameS, t1: f * frameS });
-        run = -1;
-      }
-    }
-    return {
-      duration,
-      start: Math.max(0, first * frameS - SPEECH_PAD_S),
-      end: Math.min(duration, (last + 1) * frameS + SPEECH_PAD_S),
-      pauses,
-      threshold
-    };
-  }
-
-  /* Instant de début de chaque mot dans l'audio (secondes).
-     tokens : mots tels qu'affichés ; weights : durée relative de chaque mot. */
-  function alignWords(tokens, weights, an) {
-    const n = tokens.length;
-    const start = an.start;
-    const end = Math.max(an.end, start + 0.05);
-    if (!n) return [];
-    if (n === 1) return [start];
-    const kinds = tokens.map(boundaryKind);
-    const uStart = new Array(n);
-    const uEnd = new Array(n);
-    let u = 0;
-    for (let i = 0; i < n; i++) {
-      uStart[i] = u;
-      u += Math.max(0.5, weights[i] || 1);
-      uEnd[i] = u;
-      if (i < n - 1 && kinds[i]) u += PAUSE_UNITS[kinds[i]];
-    }
-    const U = uEnd[n - 1];
-    const dur = end - start;
-    const est = (x) => start + (x / U) * dur;
-    const centre = (i) => est(uEnd[i] + PAUSE_UNITS[kinds[i]] / 2);
-
-    // Frontières où une pause est attendue (ponctuation) ; on les apparie, dans l'ordre,
-    // aux silences réellement mesurés.
-    const cand = [];
-    for (let i = 0; i < n - 1; i++) if (kinds[i]) cand.push(i);
-    const tol = Math.max(0.3, dur * 0.18);
-    const matches = [];
-    let ci = 0;
-    for (const p of an.pauses || []) {
-      if (p.t1 > end || p.t0 < start) continue;
-      const pc = (p.t0 + p.t1) / 2;
-      while (ci < cand.length && centre(cand[ci]) < pc - tol) ci++;
-      let best = -1;
-      let bestD = Infinity;
-      for (let j = ci; j < cand.length && centre(cand[j]) <= pc + tol; j++) {
-        const d = Math.abs(centre(cand[j]) - pc);
-        if (d < bestD) { bestD = d; best = j; }
-      }
-      if (best >= 0) {
-        matches.push({ i: cand[best], t0: p.t0, t1: p.t1 });
-        ci = best + 1;
-      }
-    }
-
-    // Segments entre silences appariés : répartition proportionnelle dans chacun.
-    const starts = new Array(n);
-    let a = 0;
-    for (let m = 0; m <= matches.length; m++) {
-      const b = m < matches.length ? matches[m].i : n - 1;
-      const T0 = m === 0 ? start : matches[m - 1].t1;
-      const T1 = m < matches.length ? matches[m].t0 : end;
-      const span = uEnd[b] - uStart[a];
-      for (let k = a; k <= b; k++) {
-        starts[k] = T1 > T0 && span > 0 ? T0 + ((uStart[k] - uStart[a]) / span) * (T1 - T0) : est(uStart[k]);
-      }
-      a = b + 1;
-    }
-    for (let i = 1; i < n; i++) if (starts[i] < starts[i - 1]) starts[i] = starts[i - 1];
-    return starts;
-  }
-
-  /* Poids d'un mot quand on n'a pas de phonétique : ses lettres, à peu près un son chacune. */
-  function letterWeight(token) {
-    const letters = Array.from(String(token).replace(/[^\p{L}\p{N}]/gu, '')).length;
-    return Math.max(1, letters * 0.8);
-  }
-
   const pad2 = (n) => String(n).padStart(2, '0');
 
   function formatClock(ms) {
@@ -645,7 +196,7 @@
     return sec ? `${m} min ${pad2(sec)} s` : `${m} min`;
   }
 
-  const Core = { orpIndex, splitWord, weightOf, isAbbreviation, expandToken, tokenize, fitFontSize, voiceChunk, wordTimes, locateOffset, syllableCount, wordWeight, pauseWeight, analyzeSpeech, alignWords, wordAtTime, parseWav, encodeWav, normalizePeak, prepareClip, formatClock, formatHuman };
+  const Core = { orpIndex, splitWord, weightOf, isAbbreviation, expandToken, tokenize, fitFontSize, formatClock, formatHuman };
   if (typeof module !== 'undefined' && module.exports) module.exports = Core;
   if (typeof document === 'undefined') return;
   window.FoveaCore = Core;
@@ -661,23 +212,15 @@
   const RAMP = [1.9, 1.5, 1.2];         // les premiers mots après un départ sont plus lents
   const STORE = {
     text: 'fovea.text', wpm: 'fovea.wpm', pauses: 'fovea.pauses',
-    voice: 'fovea.voice', voiceUri: 'fovea.voiceUri',
-    engine: 'fovea.engine', elKey: 'fovea.elKey', elVoice: 'fovea.elVoice', elCustom: 'fovea.elCustom',
-    piperVoice: 'fovea.piperVoice', piperSpeaker: 'fovea.piperSpeaker', meloUrl: 'fovea.meloUrl'
+    voice: 'fovea.voice', voiceId: 'fovea.voiceid'
   };
-  const VOICE_WPM_AT_RATE_1 = 170;      // débit moyen d'une voix à vitesse 1
-  const VOICE_RATE_MIN = 0.5;
-  const VOICE_RATE_MAX = 3;
-  const VOICE_ESTIMATE_AFTER_MS = 350;  // sans évènement « mot » au bout de ce délai : mode estimé
-  const NATURAL_SCORE = 90;             // à partir de cette note, une voix est classée « naturelle »
-  const STORE_NO_EVENTS = 'fovea.voiceNoEvents';
 
   const $ = (id) => document.getElementById(id);
   const el = {
     editor: $('editor'), reader: $('reader'),
     source: $('source'), error: $('editor-error'),
     statWords: $('stat-words'), statTime: $('stat-time'),
-    btnClear: $('btn-clear'), btnStart: $('btn-start'),
+    btnSample: $('btn-sample'), btnClear: $('btn-clear'), btnStart: $('btn-start'),
     btnEdit: $('btn-edit'), status: $('status'),
     stage: $('stage'), word: $('word'),
     before: $('w-before'), pivot: $('w-pivot'), after: $('w-after'), probe: $('probe'),
@@ -686,12 +229,8 @@
     pct: $('pct'), pos: $('pos'), remaining: $('remaining'),
     btnPlay: $('btn-play'), iconPlay: $('icon-play'), iconPause: $('icon-pause'),
     btnBack: $('btn-back'), btnFwd: $('btn-fwd'), btnRestart: $('btn-restart'),
-    range: $('wpm-range'), big: $('wpm-big'), pauses: $('opt-pauses'),
-    voiceOn: $('opt-voice'), voiceBox: $('voice-box'), voiceSelect: $('voice-select'), voiceNote: $('voice-note'),
-    engine: $('engine-select'), panelBrowser: $('panel-browser'), panelEleven: $('panel-eleven'),
-    elKey: $('el-key'), elVoice: $('el-voice'), elCustom: $('el-custom'), elRefresh: $('el-refresh'),
-    panelPiper: $('panel-piper'), piperVoice: $('piper-voice'), piperSpeakerBox: $('piper-speaker-box'), piperSpeaker: $('piper-speaker'),
-    piperProgress: $('piper-progress'), panelMelo: $('panel-melo'), meloUrl: $('melo-url'), meloTest: $('melo-test')
+    range: $('wpm-range'), big: $('wpm-big'), wpmUnit: $('wpm-unit'), pauses: $('opt-pauses'),
+    optVoice: $('opt-voice'), voiceSelect: $('voice-select'), voiceStatus: $('voice-status')
   };
 
   const store = {
@@ -719,6 +258,476 @@
     stageW: 0
   };
 
+  /* ======================================================================
+     3. VOIX — Piper en WebAssembly, synchro exacte sur l'audio
+     ====================================================================== */
+
+  const PIPER_CDN = 'https://cdn.jsdelivr.net/npm/@mintplex-labs/piper-tts-web@1.0.5/dist/piper-tts-web.js';
+  const VOICES = [
+    { id: 'fr_FR-upmc-medium', label: 'UPMC · médium — femme (77 Mo)' },
+    { id: 'fr_FR-siwis-medium', label: 'SIWIS · médium — homme (63 Mo)' },
+    { id: 'fr_FR-siwis-low', label: 'SIWIS · low — homme (28 Mo)' },
+    { id: 'fr_FR-tom-medium', label: 'Tom · médium — homme (64 Mo)' },
+    { id: 'fr_FR-gilles-low', label: 'Gilles · low — homme (63 Mo)' },
+    { id: 'fr_FR-mls-medium', label: 'MLS · médium — collectif (77 Mo)' }
+  ];
+  const SEG_MAX_WORDS = 60;      // coupe d'un segment au-delà (limite la latence de synthèse)
+  const SEG_MAX_CHARS = 280;
+  const VOICE_LOOKAHEAD = 12;    // segments synthétisés en avance sur la lecture
+  const VOICE_WPM_REF = 300;     // 300 mots/min = voix ×1
+  const VOICE_MIN_WPM = 150;     // ×0,5
+  const VOICE_MAX_WPM = 600;     // ×2
+
+  const voice = {
+    on: false,
+    id: VOICES[0].id,
+    segs: [],           // [{ first, count, cum, text, buf, dur, start, job, times }]
+    mods: {},           // modules Piper chargés (un par voix)
+    ctx: null,          // AudioContext
+    src: null,          // AudioBufferSourceNode courant
+    clock: null,        // { k, segStart, anchorPos, t0, rate } tant qu'un son joue
+    pos: 0,             // position sur la ligne de temps audio (secondes à ×1)
+    playing: false,
+    waiting: false,     // lecture suspendue le temps de synthétiser le segment suivant
+    waitSeg: null,
+    gen: 0,             // jeton d'invalidation des synthèses en cours
+    pointer: 0,         // index du segment en lecture
+    raf: 0,
+    estWordDur: 0.33,   // secondes audio par unité de poids (estimation)
+    knownDur: 0,
+    knownWeight: 0
+  };
+
+  const voiceRate = () => clamp(state.wpm / VOICE_WPM_REF, 0.5, 2);
+
+  function audioCtx() {
+    if (!voice.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) throw new Error('AudioContext indisponible dans ce navigateur');
+      voice.ctx = new AC();
+    }
+    if (voice.ctx.state === 'suspended') voice.ctx.resume();
+    return voice.ctx;
+  }
+
+  /* La librairie Piper garde une session unique par module : on charge un
+     module distinct par voix (le suffixe change la clé de cache du module
+     sans changer le fichier servi). */
+  async function piper(id) {
+    if (!voice.mods[id]) {
+      voice.mods[id] = import(PIPER_CDN + '?voice=' + encodeURIComponent(id));
+    }
+    return voice.mods[id];
+  }
+
+  function setVoiceStatus(text) { el.voiceStatus.textContent = text || ''; }
+
+  function updateRateDisplay() {
+    el.wpmUnit.textContent = voice.on
+      ? 'mots / min · voix ×' + voiceRate().toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      : 'mots / min';
+  }
+
+  function endsSentence(token) {
+    const stripped = token.replace(CLOSERS, '');
+    return SENTENCE_END.test(stripped) && !isAbbreviation(stripped);
+  }
+
+  /* Découpe le texte en segments d'environ une phrase. Chaque segment est
+     synthétisé séparément : la durée réelle de son audio donne l'échelle de
+     temps sur laquelle ses mots sont répartis (synchro exacte aux bornes). */
+  function buildSegments() {
+    const segs = [];
+    const words = state.words;
+    let i = 0;
+    while (i < words.length) {
+      let text = '';
+      let count = 0;
+      const first = i;
+      while (i < words.length) {
+        const w = words[i];
+        i++;
+        text += (count === 0 || w.j) ? w.t : ' ' + w.t;   // morceaux de mots coupés : collés
+        count++;
+        if (w.p || endsSentence(w.t) || count >= SEG_MAX_WORDS || text.length >= SEG_MAX_CHARS) break;
+      }
+      const cum = new Array(count + 1);
+      cum[0] = 0;
+      for (let k = 0; k < count; k++) cum[k + 1] = cum[k] + words[first + k].w;
+      segs.push({ first, count, cum, text: text.trim(), buf: null, dur: 0, start: 0, job: null, times: null });
+    }
+    return segs;
+  }
+
+  function prepareVoiceText(resetPos) {
+    voice.gen++;
+    voice.segs = buildSegments();
+    voice.knownDur = 0;
+    voice.knownWeight = 0;
+    voice.estWordDur = 0.33;
+    voice.waiting = false;
+    voice.waitSeg = null;
+    voice.pointer = 0;
+    recomputeLayout();
+    if (resetPos) {
+      stopSource();
+      voice.pos = 0;
+    }
+  }
+
+  const estDur = (s) => voice.estWordDur * s.cum[s.count];
+
+  /* Début de chaque segment sur la ligne de temps : durée réelle quand elle
+     est connue, estimation sinon (les segments non synthétisés sont
+     repositionnés au fur et à mesure). */
+  function recomputeLayout() {
+    let t = 0;
+    for (const s of voice.segs) {
+      s.start = t;
+      t += s.buf ? s.dur : estDur(s);
+      s.times = null;
+    }
+  }
+
+  function voiceTotal() {
+    let t = 0;
+    for (const s of voice.segs) t += s.buf ? s.dur : estDur(s);
+    return t;
+  }
+
+  /* Instants d'affichage des mots d'un segment (une fois son audio connu). */
+  function segSchedule(s) {
+    if (!s.buf) return null;
+    if (!s.times) {
+      const total = s.cum[s.count] || 1;
+      const times = new Array(s.count + 1);
+      for (let k = 0; k <= s.count; k++) times[k] = s.start + (s.dur * s.cum[k]) / total;
+      s.times = times;
+    }
+    return s.times;
+  }
+
+  function segOfPos(pos) {
+    const segs = voice.segs;
+    let lo = 0, hi = segs.length - 1, best = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (segs[mid].start <= pos) { best = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    return best;
+  }
+
+  function segOfWord(i) {
+    const segs = voice.segs;
+    let lo = 0, hi = segs.length - 1, best = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (segs[mid].first <= i) { best = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    return best;
+  }
+
+  function wordAtTime(seg, local) {
+    const times = segSchedule(seg);
+    let j = 0;
+    if (times) {
+      while (j < seg.count - 1 && local >= times[j + 1]) j++;
+      while (j > 0 && local < times[j]) j--;
+    }
+    return j;
+  }
+
+  function timeOfWord(i) {
+    const segs = voice.segs;
+    if (!segs.length) return 0;
+    const s = segs[segOfWord(i)];
+    const times = segSchedule(s);
+    return times ? times[clamp(i - s.first, 0, s.count - 1)] : s.start;
+  }
+
+  function handleVoiceError(err) {
+    console.error(err);
+    setVoiceStatus('⚠ Synthèse vocale impossible — vérifiez la connexion, puis relancez ou désactivez la dictée.');
+    voice.waiting = false;
+    voice.waitSeg = null;
+    if (voice.playing) voicePause();
+  }
+
+  /* Synthèse d'un segment (avec cache : buf / job sur le segment). */
+  function synthesize(seg, k) {
+    if (seg.buf) return Promise.resolve(seg.buf);
+    if (seg.job) return seg.job;
+    const gen = voice.gen;
+    seg.job = (async () => {
+      const mod = await piper(voice.id);
+      const blob = await mod.predict({ text: seg.text, voiceId: voice.id }, (p) => {
+        if (gen !== voice.gen) return;
+        setVoiceStatus(p.total
+          ? 'Téléchargement de la voix… ' + Math.min(100, Math.round((p.loaded / p.total) * 100)) + ' %'
+          : 'Téléchargement de la voix…');
+      });
+      if (gen !== voice.gen) return null;
+      const ctx = audioCtx();
+      const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+      if (gen !== voice.gen) return null;
+      seg.buf = buf;
+      seg.dur = buf.duration;
+      onSegmentReady(k);
+      return buf;
+    })();
+    seg.job.catch((err) => {
+      if (gen !== voice.gen) return;
+      seg.job = null;
+      handleVoiceError(err);
+    });
+    return seg.job;
+  }
+
+  /* File de production : d'abord le segment attendu par la lecture, puis une
+     fenêtre d'avance à partir du segment courant. Une seule synthèse à la
+     fois (l'inférence est déjà lourde). */
+  function pump() {
+    if (!voice.on || !voice.segs.length) return;
+    const segs = voice.segs;
+    if (voice.waitSeg != null) {
+      const s = segs[voice.waitSeg];
+      if (s && !s.buf && !s.job) { synthesize(s, voice.waitSeg); return; }
+    }
+    const to = Math.min(segs.length, voice.pointer + VOICE_LOOKAHEAD);
+    for (let k = voice.pointer; k < to; k++) {
+      if (!segs[k].buf && !segs[k].job) { synthesize(segs[k], k); return; }
+    }
+  }
+
+  function waitForSegment(k) {
+    voice.waiting = true;
+    voice.waitSeg = k;
+    setVoiceStatus('Synthèse de la voix en cours…');
+    pump();
+  }
+
+  function onSegmentReady(k) {
+    const seg = voice.segs[k];
+    if (!seg) return;
+    voice.knownDur += seg.dur;
+    voice.knownWeight += seg.cum[seg.count];
+    voice.estWordDur = voice.knownWeight > 0 ? voice.knownDur / voice.knownWeight : 0.33;
+    recomputeLayout();
+    if (voice.waitSeg === k) {
+      voice.waiting = false;
+      voice.waitSeg = null;
+      if (voice.playing) {
+        setVoiceStatus('');
+        if (!startSourceAt(voice.pos)) waitForSegment(segOfPos(voice.pos));
+      } else {
+        // posé en pause sur un segment fraîchement synthétisé
+        const j = wordAtTime(seg, voice.pos - seg.start);
+        state.index = seg.first + j;
+        state.finished = false;
+        showWord(state.index);
+        setVoiceStatus('');
+      }
+      renderContext();
+      updateProgress();
+      setUiPlaying();
+    }
+    pump();
+  }
+
+  /* Position courante sur la ligne de temps audio (secondes à ×1). */
+  function voiceNow() {
+    if (!voice.clock) return voice.pos;
+    return voice.clock.anchorPos + (voice.ctx.currentTime - voice.clock.t0) * voice.clock.rate;
+  }
+
+  function stopSource() {
+    if (voice.src) {
+      voice.src.onended = null;
+      try { voice.src.stop(); } catch (e) { /* déjà arrêté */ }
+      voice.src = null;
+    }
+    voice.clock = null;
+  }
+
+  function startSourceAt(pos) {
+    const segs = voice.segs;
+    if (!segs.length) return false;
+    let k = segOfPos(pos);
+    let seg = segs[k];
+    if (!seg || !seg.buf) return false;
+    let offset = pos - seg.start;
+    while (offset >= seg.dur && k + 1 < segs.length && segs[k + 1].buf) {
+      offset -= seg.dur;
+      k++;
+      seg = segs[k];
+    }
+    if (offset >= seg.dur) offset = Math.max(0, seg.dur - 0.02);
+    offset = Math.max(0, offset);
+    const ctx = audioCtx();
+    const src = ctx.createBufferSource();
+    src.buffer = seg.buf;
+    src.playbackRate.value = voiceRate();
+    src.connect(ctx.destination);
+    src.onended = () => {
+      if (voice.src !== src) return;
+      voice.src = null;
+      voice.clock = null;
+      onSegmentEnded(k);
+    };
+    src.start(0, offset);
+    voice.src = src;
+    voice.pointer = k;
+    voice.clock = { k, segStart: seg.start, anchorPos: seg.start + offset, t0: ctx.currentTime, rate: voiceRate() };
+    return true;
+  }
+
+  function onSegmentEnded(k) {
+    const seg = voice.segs[k];
+    if (seg) voice.pos = seg.start + seg.dur;
+    const next = k + 1;
+    if (next >= voice.segs.length) { voiceFinish(); return; }
+    voice.pointer = next;
+    if (!startSourceAt(voice.pos)) waitForSegment(next);
+  }
+
+  /* Boucle d'affichage : le mot montré est une fonction pure de l'horloge
+     audio — c'est ce qui garantit la synchro avec la dictée. */
+  function updateVoiceWord(pos) {
+    const segs = voice.segs;
+    let k = voice.pointer;
+    const cur = segs[k];
+    if (!cur || !cur.buf || pos < cur.start - 0.05 || (pos >= cur.start + cur.dur && k + 1 < segs.length)) {
+      k = segOfPos(pos);
+      const seg = segs[k];
+      if (!seg || !seg.buf) return;          // segment pas encore prêt : l'affichage attend
+      voice.pointer = k;
+    }
+    const seg = segs[k];
+    const j = wordAtTime(seg, pos - seg.start);
+    const idx = seg.first + j;
+    if (idx !== state.index) {
+      state.index = idx;
+      state.finished = false;
+      showWord(idx);
+    }
+  }
+
+  function voiceFrame() {
+    voice.raf = 0;
+    if (!voice.on || !voice.playing) return;
+    // Recalage de l'ancre si le début du segment courant a été réestimé.
+    if (voice.clock) {
+      const seg = voice.segs[voice.clock.k];
+      if (seg && seg.start !== voice.clock.segStart) {
+        const shift = seg.start - voice.clock.segStart;
+        voice.clock.segStart = seg.start;
+        voice.clock.anchorPos += shift;
+      }
+    }
+    voice.pos = voiceNow();
+    updateVoiceWord(voice.pos);
+    updateProgress();
+    voice.raf = requestAnimationFrame(voiceFrame);
+  }
+
+  function voicePlay() {
+    if (voice.playing || !voice.segs.length) return;
+    if (state.finished) {
+      state.finished = false;
+      state.index = 0;
+      voice.pos = 0;
+    }
+    if (!voice.clock && voiceTotal() - voice.pos < 0.02) voice.pos = 0;
+    audioCtx();
+    voice.playing = true;
+    state.playing = true;
+    voice.pointer = segOfPos(voice.pos);
+    setUiPlaying();
+    renderContext();
+    if (!voice.raf) voice.raf = requestAnimationFrame(voiceFrame);
+    if (!startSourceAt(voice.pos)) waitForSegment(segOfPos(voice.pos));
+    else setVoiceStatus('');
+    pump();
+  }
+
+  function voicePause() {
+    if (!voice.playing) return;
+    voice.pos = voiceNow();
+    stopSource();
+    voice.playing = false;
+    voice.waiting = false;
+    voice.waitSeg = null;
+    if (voice.raf) { cancelAnimationFrame(voice.raf); voice.raf = 0; }
+    state.playing = false;
+    setUiPlaying();
+    renderContext();
+    updateProgress();
+  }
+
+  function voiceFinish() {
+    stopSource();
+    voice.playing = false;
+    voice.waiting = false;
+    voice.waitSeg = null;
+    if (voice.raf) { cancelAnimationFrame(voice.raf); voice.raf = 0; }
+    state.playing = false;
+    state.finished = true;
+    voice.pos = voiceTotal();
+    if (state.words.length) {
+      state.index = state.words.length - 1;
+      showWord(state.index);
+    }
+    setVoiceStatus('');
+    setUiPlaying();
+    updateProgress();
+    renderContext();
+  }
+
+  function voiceSeekTime(t) {
+    const total = voiceTotal();
+    t = clamp(t, 0, Math.max(0, total - 0.02));
+    const wasPlaying = voice.playing;
+    if (wasPlaying) {
+      voice.pos = voiceNow();
+      stopSource();
+      voice.waiting = false;
+    }
+    voice.pos = t;
+    voice.pointer = segOfPos(t);
+    state.finished = false;
+    if (wasPlaying) {
+      if (!startSourceAt(t)) waitForSegment(voice.pointer);
+      else setVoiceStatus('');
+    } else {
+      voice.waitSeg = voice.pointer;
+      pump();
+    }
+    const seg = voice.segs[voice.pointer];
+    if (seg && seg.buf) {
+      state.index = seg.first + wordAtTime(seg, t - seg.start);
+      showWord(state.index);
+    } else {
+      state.index = seg ? seg.first : 0;
+    }
+    if (!voice.playing) {
+      updateProgress();
+      setUiPlaying();
+      renderContext();
+    }
+  }
+
+  function voiceSeekWord(i) {
+    const n = state.words.length;
+    if (!n || !voice.segs.length) return;
+    i = clamp(Math.round(i), 0, n - 1);
+    const seg = voice.segs[segOfWord(i)];
+    const times = segSchedule(seg);
+    voiceSeekTime(times ? times[clamp(i - seg.first, 0, seg.count - 1)] : seg.start);
+    state.index = i;        // mot visé, affiché même si l'audio doit suivre
+    showWord(i);
+    if (!voice.playing) { updateProgress(); renderContext(); }
+  }
+
   /* ---------- Jetons (avec cache sur le texte) ---------- */
 
   let cache = { text: null, tok: null };
@@ -728,34 +737,7 @@
   }
 
   const weightAt = (i) => (state.pauses ? state.words[i].w : 1);
-  const voice = {
-    supported: typeof window !== 'undefined' && 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window,
-    on: false,
-    engine: 'piper',     // 'piper', 'melo', 'eleven' (ElevenLabs) ou 'browser' (voix du navigateur)
-    list: [],
-    uri: '',
-    gen: 0,              // change à chaque arrêt : les évènements d'une ancienne dictée sont ignorés
-    cur: null,           // morceau en cours de dictée
-    nextStart: -1,       // premier mot du prochain morceau à mettre en file
-    keep: [],            // références aux utterances (sinon certains navigateurs les perdent)
-    tick: 0,
-    restart: 0,
-    cps1: 15,            // caractères dictés par seconde à vitesse 1 (affiné à chaque phrase)
-    rate: 1,
-    effWpm: 0,           // débit réel mesuré de la voix
-    noEvents: false,     // la voix ne signale pas les mots
-    lastRate: 0,
-    watch: 0,
-    problem: '',
-    best: 0,             // note de la meilleure voix française détectée
-    noEventsIds: new Set()   // voix déjà observées sans évènements « mot »
-  };
-  try {
-    JSON.parse(localStorage.getItem('fovea.voiceNoEvents') || '[]').forEach((id) => voice.noEventsIds.add(id));
-  } catch (e) { /* stockage indisponible */ }
-
-  const speechWpm = () => voice.effWpm || Math.min(state.wpm, VOICE_WPM_AT_RATE_1 * VOICE_RATE_MAX);
-  const baseMs = () => 60000 / (voice.on ? speechWpm() : state.wpm);
+  const baseMs = () => 60000 / state.wpm;
 
   function rebuildCum() {
     const n = state.words.length;
@@ -850,8 +832,14 @@
     el.bar.setAttribute('aria-valuenow', String(Math.round(pct)));
     el.pct.textContent = Math.round(pct) + ' %';
     el.pos.textContent = `mot ${(state.index + 1).toLocaleString('fr-FR')} / ${n.toLocaleString('fr-FR')}`;
-    const left = state.finished ? 0 : (state.cum[n] - state.cum[state.index]) * baseMs();
-    el.remaining.textContent = 'reste ' + formatClock(left);
+    if (voice.on) {
+      // Temps restant dicté, ramené au mur par le facteur de vitesse de la voix.
+      const left = Math.max(0, voiceTotal() - voice.pos) / voiceRate();
+      el.remaining.textContent = 'reste ' + formatClock(left * 1000);
+    } else {
+      const left = state.finished ? 0 : (state.cum[n] - state.cum[state.index]) * baseMs();
+      el.remaining.textContent = 'reste ' + formatClock(left);
+    }
   }
 
   function setUiPlaying() {
@@ -863,7 +851,7 @@
     el.status.textContent = state.playing ? 'Lecture' : state.finished ? 'Terminé' : 'Pause';
   }
 
-  /* ---------- Lecture ---------- */
+  /* ---------- Lecture (mode muet) ---------- */
 
   function duration(i) {
     return baseMs() * weightAt(i);
@@ -890,27 +878,22 @@
   }
 
   function play() {
+    if (voice.on) { voicePlay(); return; }
     if (state.playing || !state.words.length) return;
     if (state.finished) { state.index = 0; state.finished = false; }
     state.playing = true;
-    voice.problem = '';
+    state.rampIdx = 0;
+    state.target = performance.now();
     setUiPlaying();
     renderContext();
-    if (voice.on) {
-      if (!elevenResume()) voiceStart(state.index);   // ElevenLabs : reprise sans redemander l'audio
-    } else {
-      state.rampIdx = 0;
-      state.target = performance.now();
-      step();
-    }
-    updateVoiceNote();
+    step();
   }
 
   function pause() {
+    if (voice.on) { voicePause(); return; }
     if (!state.playing) return;
     state.playing = false;
     clearTimeout(state.timer);
-    if (!elevenPause()) voiceCancel();
     setUiPlaying();
     renderContext();
   }
@@ -919,7 +902,6 @@
     state.playing = false;
     state.finished = true;
     clearTimeout(state.timer);
-    voiceCancel();
     setUiPlaying();
     updateProgress();
     renderContext();
@@ -930,17 +912,14 @@
   function seek(i) {
     const n = state.words.length;
     if (!n) return;
+    if (voice.on) { voiceSeekWord(i); return; }
     state.index = clamp(Math.round(i), 0, n - 1);
     state.finished = false;
     if (state.playing) {
       clearTimeout(state.timer);
-      if (voice.on) {
-        voiceStart(state.index);
-      } else {
-        state.target = performance.now();
-        state.rampIdx = 1;
-        step();
-      }
+      state.target = performance.now();
+      state.rampIdx = 1;
+      step();
     } else {
       showWord(state.index);
       updateProgress();
@@ -950,6 +929,7 @@
   }
 
   function skip(ms) {
+    if (voice.on) { voiceSeekTime(voiceNow() + ms / 1000); return; }
     let i = state.index;
     let acc = 0;
     const last = state.words.length - 1;
@@ -962,649 +942,25 @@
   }
 
   function restart() {
+    if (voice.on) {
+      voiceSeekWord(0);
+      if (!voice.playing) voicePlay();
+      return;
+    }
     clearTimeout(state.timer);
-    voiceCancel();
     state.playing = false;
     state.index = 0;
     state.finished = false;
     play();
   }
 
-  /* ---------- Voix ----------
-     Principe : quand la voix est active, c'est elle qui fait avancer l'affichage.
-     Le texte est dicté par phrases. Chaque évènement « mot » du moteur vocal
-     (onboundary) affiche le mot prononcé à cet instant. Les voix qui n'émettent
-     pas ces évènements (certaines voix en ligne) passent en mode estimé : la
-     position est calculée à partir du débit mesuré, et recalée au début et à
-     la fin de chaque phrase. */
-
-  // Voix enregistrées (Piper, MeloTTS, ElevenLabs) : la lecture est accélérée ou ralentie à partir du débit mesuré.
-  const isClip = () => voice.engine !== 'browser';
-  const rateBase = () => (isClip() ? clamp(eleven.wpm1, 90, 260) : VOICE_WPM_AT_RATE_1);
-  const voiceRate = () => clamp(state.wpm / rateBase(), VOICE_RATE_MIN, VOICE_RATE_MAX);
-  const voiceId = (v) => v.voiceURI || v.name;
-  const pickVoice = () => voice.list.find((v) => voiceId(v) === voice.uri) || null;
-
-  function setIndex(i) {
-    if (i === state.index) return;
-    state.index = i;
-    showWord(i);
-    updateProgress();
-  }
-
-  function voiceCancel() {
-    elevenKill();
-    voice.gen++;
-    clearTimeout(voice.restart);
-    clearTimeout(voice.watch);
-    clearInterval(voice.tick);
-    voice.tick = 0;
-    voice.cur = null;
-    voice.keep = [];
-    voice.nextStart = -1;
-    if (voice.supported) {
-      try { window.speechSynthesis.cancel(); } catch (e) { /* ignoré */ }
-    }
-  }
-
-  // Si la voix ne démarre pas (son bloqué, moteur absent), on le dit au lieu de rester figé.
-  function voiceWatch() {
-    clearTimeout(voice.watch);
-    const gen = voice.gen;
-    voice.watch = setTimeout(() => {
-      if (gen !== voice.gen || !state.playing) return;
-      voice.problem = 'La voix ne répond pas. Choisissez une autre voix ou vérifiez le son.';
-      pause();
-      updateVoiceNote();
-    }, 5000);
-  }
-
-  function voiceQueue(start) {
-    const n = state.words.length;
-    if (start >= n) return;
-    const gen = voice.gen;
-    const chunk = voiceChunk(state.words, start);
-    const u = new window.SpeechSynthesisUtterance(chunk.text);
-    const v = pickVoice();
-    if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = document.documentElement.lang || 'fr-FR'; }
-    u.rate = voice.rate;
-    const info = { chunk, u, rate: voice.rate, startT: 0, mode: 'wait', anchorT: 0, anchorChar: 0 };
-
-    u.onstart = () => {
-      if (gen !== voice.gen) return;
-      clearTimeout(voice.watch);
-      info.startT = performance.now();
-      info.anchorT = info.startT;
-      voice.cur = info;
-      setIndex(chunk.start);
-      if (voice.nextStart === chunk.end + 1) voiceQueue(voice.nextStart);   // phrase suivante en avance : pas de trou
-    };
-
-    u.onboundary = (e) => {
-      if (gen !== voice.gen || voice.cur !== info) return;
-      if (e.name && e.name !== 'word') return;
-      const k = locateOffset(chunk.offsets, e.charIndex || 0);
-      info.mode = 'boundary';
-      info.anchorT = performance.now();
-      info.anchorChar = chunk.offsets[k];
-      if (voice.noEvents) { voice.noEvents = false; updateVoiceNote(); }
-      setIndex(chunk.start + k);
-    };
-
-    u.onend = () => {
-      if (gen !== voice.gen) return;
-      const secs = (performance.now() - info.startT) / 1000;
-      if (voice.cur === info && secs > 0.4 && chunk.text.length > 8) {
-        const cps1 = chunk.text.length / secs / info.rate;
-        voice.cps1 = voice.cps1 * 0.5 + cps1 * 0.5;
-        const wpm = ((chunk.end - chunk.start + 1) / secs) * 60;
-        voice.effWpm = voice.effWpm ? voice.effWpm * 0.6 + wpm * 0.4 : wpm;
-      }
-      // Recalage : le dernier mot de la phrase est affiché à la fin. Si la phrase suivante
-      // a déjà démarré (certains moteurs inversent l'ordre des évènements), on ne revient pas en arrière.
-      if (voice.cur === info || !voice.cur) {
-        voice.cur = null;
-        setIndex(chunk.end);
-      }
-      if (chunk.end >= n - 1) { finish(); return; }
-      voiceWatch();
-      updateVoiceNote();
-    };
-
-    u.onerror = (e) => {
-      if (gen !== voice.gen) return;
-      if (e.error === 'canceled' || e.error === 'interrupted') return;
-      voice.problem = `La voix a rencontré une erreur (${e.error || 'inconnue'}).`;
-      pause();
-      updateVoiceNote();
-    };
-
-    voice.keep.push(u);
-    if (voice.keep.length > 4) voice.keep.shift();
-    voice.nextStart = chunk.end + 1;
-    try {
-      window.speechSynthesis.speak(u);
-    } catch (e) {
-      voice.problem = 'La voix n’a pas pu démarrer sur ce navigateur.';
-      pause();
-      updateVoiceNote();
-    }
-  }
-
-  function voiceTick() {
-    const info = voice.cur;
-    if (!info || !state.playing) return;
-    const now = performance.now();
-    if (info.mode === 'wait' && now - info.startT > VOICE_ESTIMATE_AFTER_MS) {
-      info.mode = 'estimate';
-      info.anchorT = info.startT;
-      info.anchorChar = 0;
-      if (!voice.noEvents) {
-        voice.noEvents = true;
-        if (!voice.noEventsIds.has(voice.uri)) {
-          voice.noEventsIds.add(voice.uri);
-          store.set(STORE_NO_EVENTS, JSON.stringify([...voice.noEventsIds]));
-          loadVoices();                       // met à jour l'étiquette « synchro estimée » de la liste
-        }
-        updateVoiceNote();
-      }
-    }
-    if (info.mode === 'wait') return;
-    const { chunk } = info;
-    const last = chunk.offsets.length - 1;
-    const pos = info.anchorChar + ((now - info.anchorT) / 1000) * voice.cps1 * info.rate;
-    const cur = clamp(state.index - chunk.start, 0, last);
-    let k = locateOffset(chunk.offsets, pos);
-    if (info.mode === 'boundary') {
-      // Le moteur donne le début de chaque mot ; on n'avance seul que dans un mot coupé en morceaux.
-      let g = cur;
-      while (g < last && state.words[chunk.start + g + 1].j) g++;
-      k = Math.min(k, g);
-    } else {
-      k = Math.min(k, Math.max(0, last - 1));   // le dernier mot n'apparaît qu'à la fin réelle de la phrase
-    }
-    setIndex(chunk.start + Math.max(k, cur));
-  }
-
-  function voiceStart(from) {
-    if (isClip()) elevenStart(from);        // session de clips audio : Piper, MeloTTS ou ElevenLabs
-    else browserStart(from);
-  }
-
-  function browserStart(from) {
-    voiceCancel();
-    voice.rate = voiceRate();
-    if (voice.lastRate && voice.lastRate !== voice.rate && voice.effWpm) voice.effWpm *= voice.rate / voice.lastRate;
-    voice.lastRate = voice.rate;
-    state.index = clamp(from, 0, state.words.length - 1);
-    showWord(state.index);
-    updateProgress();
-    const gen = voice.gen;
-    try { window.speechSynthesis.resume(); } catch (e) { /* ignoré */ }
-    // Petit délai après cancel() : certains navigateurs ignorent un speak() immédiat.
-    setTimeout(() => { if (gen === voice.gen) voiceQueue(state.index); }, 60);
-    voice.tick = setInterval(voiceTick, 40);
-    voiceWatch();
-  }
-
-  function scheduleVoiceRestart() {
-    clearTimeout(voice.restart);
-    voice.restart = setTimeout(() => {
-      if (state.playing && voice.on) voiceStart(state.index);
-    }, 300);
-  }
-
-  function updateVoiceNote() {
-    const parts = [];
-    if (voice.problem) parts.push(voice.problem);
-    if (voice.on && voice.engine === 'eleven') {
-      if (!eleven.key) parts.push('Saisissez votre clé API ElevenLabs pour utiliser ces voix.');
-      else if (eleven.listError && eleven.listError !== voice.problem) parts.push(eleven.listError);
-      else if (eleven.loading) parts.push('Recherche des voix de votre compte…');
-      const s = eleven.session;
-      if (s && state.playing && !s.paused && !s.active) parts.push('Génération de la voix…');
-    } else if (voice.on) {
-      if (!voice.supported) {
-        parts.push('La voix du navigateur n’est pas disponible ici.');
-      } else {
-        if (!voice.list.length) parts.push('Aucune voix détectée sur cet appareil.');
-        if (voice.noEvents) parts.push('Cette voix ne signale pas chaque mot : l’affichage se recale à chaque phrase. Pour une synchro exacte, choisissez une voix locale ou « Natural ».');
-        if (voice.list.length && voice.best < NATURAL_SCORE) {
-          parts.push('Aucune voix naturelle détectée. Sous Edge, les voix « Online (Natural) » sont très naturelles ; sous macOS et iOS, ajoutez une voix Premium (Réglages › Accessibilité › Contenu énoncé) ; sous Android, installez la voix Google française.');
-        }
-      }
-    }
-    if (voice.on) {
-      const cap = Math.round((rateBase() * VOICE_RATE_MAX) / 10) * 10;
-      if (state.wpm > cap) parts.push(`La voix plafonne autour de ${cap} mots/min.`);
-      if (voice.effWpm) parts.push(`Débit réel de la voix : environ ${Math.round(voice.effWpm / 5) * 5} mots/min.`);
-    }
-    el.voiceNote.textContent = parts.join(' ');
-    el.voiceNote.hidden = parts.length === 0;
-  }
-
-  function applyVoiceUi() {
-    el.voiceBox.hidden = !voice.on;
-    el.panelEleven.hidden = voice.engine !== 'eleven';
-    el.panelBrowser.hidden = voice.engine !== 'browser';
-    el.engine.value = voice.engine;
-    el.pauses.disabled = voice.on;
-    el.pauses.closest('.check').classList.toggle('is-off', voice.on);
-    updateVoiceNote();
-  }
-
-  /* ---------- Voix ElevenLabs ----------
-     Modèle eleven_multilingual_v2, route « with-timestamps » : ElevenLabs renvoie
-     l'audio ET l'instant exact où chaque caractère est prononcé. L'affichage
-     lit l'horloge de l'audio (currentTime) à chaque image : le mot affiché est le
-     mot entendu, y compris quand on change la vitesse (la lecture est accélérée
-     sans changer la hauteur de la voix). Les phrases déjà générées restent en
-     mémoire : revenir en arrière ne consomme pas de crédits. */
-
-  const EL_API = 'https://api.elevenlabs.io';
-  const EL_MODEL = 'eleven_multilingual_v2';
-  const EL_NAMES = ['Nicolas', 'Jeanne', 'Adrien', 'Aurore'];
-  const EL_WPM_AT_RATE_1 = 160;
-  const EL_CACHE_MAX = 80;
-  const SILENT_WAV = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAIARKwAABCxAgAEABAAZGF0YQQAAAAAAAAA';
-
-  const eleven = {
-    key: '',
-    sel: 'Nicolas',          // nom de la voix choisie, ou 'custom'
-    custom: '',              // ID saisi à la main
-    found: null,             // { Nicolas: { id, owner? } } une fois les voix du compte lues
-    loading: false,
-    listError: '',
-    session: null,
-    cache: new Map(),
-    wpm1: EL_WPM_AT_RATE_1   // débit de la voix à vitesse 1, mesuré sur les phrases reçues
-  };
-
-  const nameKey = (s) => String(s || '').split(/[\s\-–—·|,(:]/)[0].toLowerCase();
-
-  async function elHttp(path, opts) {
-    let res;
-    try {
-      res = await fetch(EL_API + path, opts);
-    } catch (e) {
-      if (e && e.name === 'AbortError') throw e;
-      throw new Error('Impossible de joindre ElevenLabs (réseau coupé ou accès externe bloqué). Dans la version publiée en ligne, cet accès est bloqué : ouvrez index.html sur votre ordinateur.');
-    }
-    if (res.ok) return res;
-    let detail = '';
-    try {
-      const d = (await res.json()).detail;
-      detail = typeof d === 'string' ? d : (d && d.message) || (Array.isArray(d) && d[0] && d[0].msg) || '';
-    } catch (e) { /* corps non JSON */ }
-    const base = {
-      401: 'Clé API refusée par ElevenLabs.',
-      402: 'Offre ElevenLabs insuffisante pour cette voix ou cette action.',
-      403: 'Accès refusé par ElevenLabs.',
-      404: 'Voix introuvable sur votre compte ElevenLabs.',
-      429: 'Trop de requêtes en même temps chez ElevenLabs. Réessayez dans un instant.'
-    }[res.status] || `ElevenLabs a répondu avec l’erreur ${res.status}.`;
-    throw new Error(detail && !base.includes(detail) ? `${base} (${detail})` : base);
-  }
-
-  function renderElevenVoices() {
-    const known = eleven.found;
-    el.elVoice.textContent = '';
-    for (const name of EL_NAMES) {
-      const opt = document.createElement('option');
-      opt.value = name;
-      let label = name;
-      if (known && !known[name]) label += ' (introuvable)';
-      else if (known && known[name].owner) label += ' (bibliothèque)';
-      opt.textContent = label;
-      el.elVoice.append(opt);
-    }
-    const other = document.createElement('option');
-    other.value = 'custom';
-    other.textContent = 'Autre voix (ID)…';
-    el.elVoice.append(other);
-    if (eleven.sel !== 'custom' && !EL_NAMES.includes(eleven.sel)) eleven.sel = EL_NAMES[0];
-    el.elVoice.value = eleven.sel;
-    el.elCustom.hidden = eleven.sel !== 'custom';
-  }
-
-  async function elevenLoadVoices() {
-    if (!eleven.key) {
-      eleven.found = null;
-      eleven.listError = '';
-      renderElevenVoices();
-      updateVoiceNote();
-      return;
-    }
-    const key = eleven.key;
-    const headers = { 'xi-api-key': key };
-    eleven.loading = true;
-    eleven.listError = '';
-    updateVoiceNote();
-    try {
-      const mine = (await (await elHttp('/v1/voices', { headers })).json()).voices || [];
-      const found = {};
-      for (const name of EL_NAMES) {
-        const same = mine.filter((v) => nameKey(v.name) === name.toLowerCase());
-        const v = same.find((x) => /^fr/i.test((x.labels && x.labels.language) || '')) || same[0];
-        if (v) found[name] = { id: v.voice_id };
-      }
-      // Voix absentes du compte : on les cherche dans la bibliothèque (ajout automatique au premier usage).
-      for (const name of EL_NAMES) {
-        if (found[name]) continue;
-        try {
-          const r = await elHttp(`/v1/shared-voices?search=${encodeURIComponent(name)}&language=fr&page_size=30`, { headers });
-          const hit = ((await r.json()).voices || []).find((v) => nameKey(v.name) === name.toLowerCase());
-          if (hit) found[name] = { id: hit.voice_id, owner: hit.public_owner_id };
-        } catch (e) { /* la bibliothèque est facultative */ }
-      }
-      if (key !== eleven.key) return;
-      eleven.found = found;
-    } catch (e) {
-      if (key === eleven.key) { eleven.found = null; eleven.listError = e.message; }
-    } finally {
-      if (key === eleven.key) eleven.loading = false;
-    }
-    renderElevenVoices();
-    updateVoiceNote();
-  }
-
-  async function elevenEnsureVoice() {
-    if (eleven.sel === 'custom') {
-      const id = eleven.custom.trim();
-      if (!id) throw new Error('Collez l’ID de la voix ElevenLabs à utiliser.');
-      return id;
-    }
-    if (!eleven.found) await elevenLoadVoices();
-    if (!eleven.found) throw new Error(eleven.listError || 'Impossible de lire les voix de votre compte ElevenLabs.');
-    const v = eleven.found[eleven.sel];
-    if (!v) {
-      throw new Error(`La voix ${eleven.sel} est introuvable. Ajoutez-la à votre compte depuis la bibliothèque de voix ElevenLabs, ou choisissez « Autre voix (ID) ».`);
-    }
-    if (v.owner) {
-      const res = await elHttp(`/v1/voices/add/${encodeURIComponent(v.owner)}/${encodeURIComponent(v.id)}`, {
-        method: 'POST',
-        headers: { 'xi-api-key': eleven.key, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ new_name: eleven.sel })
-      });
-      const added = await res.json();
-      if (added && added.voice_id) v.id = added.voice_id;
-      delete v.owner;
-      renderElevenVoices();
-    }
-    return v.id;
-  }
-
-  async function elevenFetchChunk(s, chunk, prevText, nextText) {
-    const cacheKey = `${s.voiceId}|${chunk.text}`;
-    const hit = eleven.cache.get(cacheKey);
-    if (hit) return hit;
-    const body = {
-      text: chunk.text,
-      model_id: EL_MODEL,
-      voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0, use_speaker_boost: true }
-    };
-    if (prevText) body.previous_text = prevText;
-    if (nextText) body.next_text = nextText;
-    const res = await elHttp(`/v1/text-to-speech/${encodeURIComponent(s.voiceId)}/with-timestamps?output_format=mp3_44100_128`, {
-      method: 'POST',
-      headers: { 'xi-api-key': eleven.key, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: s.abort.signal
-    });
-    const j = await res.json();
-    if (!j || !j.audio_base64) throw new Error('ElevenLabs n’a renvoyé aucun audio.');
-    const bin = atob(j.audio_base64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    const url = URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
-    const al = j.alignment || j.normalized_alignment || {};
-    const starts = al.character_start_times_seconds || [];
-    const ends = al.character_end_times_seconds || [];
-    const dur = ends.length ? ends[ends.length - 1] : 0;
-    const exact = starts.length === chunk.text.length;
-    // Instant de début de chaque mot (sinon, repli proportionnel à la position dans la phrase).
-    const wordT = chunk.offsets.map((o) => (exact ? starts[o] : dur ? (o / chunk.text.length) * dur : 0));
-    for (let i = 1; i < wordT.length; i++) if (wordT[i] < wordT[i - 1]) wordT[i] = wordT[i - 1];
-    const data = { url, wordT, dur };
-    eleven.cache.set(cacheKey, data);
-    if (eleven.cache.size > EL_CACHE_MAX) {
-      const oldest = eleven.cache.keys().next().value;
-      URL.revokeObjectURL(eleven.cache.get(oldest).url);
-      eleven.cache.delete(oldest);
-    }
-    if (dur > 0.5) {
-      const wpm = ((chunk.end - chunk.start + 1) / dur) * 60;
-      eleven.wpm1 = eleven.wpm1 * 0.7 + wpm * 0.3;
-      elevenRefreshWpm();
-    }
-    return data;
-  }
-
-  function elevenRefreshWpm() {
-    voice.effWpm = eleven.wpm1 * voiceRate();
-  }
-
-  function elevenFail(message) {
-    voice.problem = message;
-    pause();
-    updateVoiceNote();
-  }
-
-  function elevenStart(from) {
-    voiceCancel();
-    voice.problem = '';
-    if (voice.engine === 'eleven' && !eleven.key) { elevenFail('Saisissez votre clé API ElevenLabs pour utiliser ces voix.'); return; }
-    state.index = clamp(from, 0, state.words.length - 1);
-    showWord(state.index);
-    updateProgress();
-    const s = {
-      dead: false, paused: false, items: [], nextIdx: state.index, active: null,
-      pumping: false, n: 0, voiceId: '', prevText: '', raf: 0, engine: voice.engine, seeded: false,
-      abort: new AbortController(), els: [new Audio(), new Audio()]
-    };
-    eleven.session = s;
-    // Le clic de l'utilisateur est encore actif : on « débloque » les deux lecteurs audio (Safari, mobiles).
-    for (const a of s.els) { a.src = SILENT_WAV; const p = a.play(); if (p && p.catch) p.catch(() => {}); }
-    elevenRefreshWpm();
-    elevenPump(s);
-    s.raf = requestAnimationFrame(() => elevenLoop(s));
-    updateVoiceNote();
-  }
-
-  async function elevenPump(s) {
-    if (s.pumping || s.dead) return;
-    s.pumping = true;
-    const n = state.words.length;
-    try {
-      if (!s.voiceId) s.voiceId = await clipEnsureVoice(s);
-      // Toujours deux phrases d'avance au plus : l'audio est prêt sans gaspiller de crédits.
-      while (!s.dead && s.nextIdx < n && s.items.filter((it) => !it.started).length < 2) {
-        const chunk = voiceChunk(state.words, s.nextIdx);
-        s.nextIdx = chunk.end + 1;
-        const following = chunk.end + 1 < n ? voiceChunk(state.words, chunk.end + 1) : null;
-        const item = { chunk, data: null, started: false, el: null };
-        s.items.push(item);
-        item.data = await clipFetchChunk(s, chunk, s.prevText, following && following.text);
-        s.prevText = chunk.text;
-        if (s.dead) return;
-        elevenAdvance(s);
-        updateVoiceNote();
-      }
-    } catch (e) {
-      if (!s.dead && !(e && e.name === 'AbortError')) {
-        elevenKill();
-        elevenFail((e && e.message) || 'La voix ElevenLabs a rencontré une erreur.');
-      }
-    } finally {
-      s.pumping = false;
-    }
-  }
-
-  // Lance la phrase suivante si rien ne joue et qu'elle est prête.
-  function elevenAdvance(s) {
-    if (s.dead || s.paused || s.active) return;
-    const item = s.items.find((it) => !it.started);
-    if (item && item.data) elevenPlayItem(s, item);
-  }
-
-  function elevenPlayItem(s, item) {
-    const a = s.els[s.n++ % 2];
-    item.started = true;
-    item.el = a;
-    s.active = item;
-    a.onended = () => elevenEnded(s, item);
-    a.onerror = () => {
-      if (s.dead) return;
-      elevenKill();
-      elevenFail('Lecture audio impossible sur ce navigateur.');
-    };
-    a.src = item.data.url;
-    const rate = voiceRate();
-    a.defaultPlaybackRate = rate;
-    a.playbackRate = rate;
-    a.preservesPitch = true;
-    a.webkitPreservesPitch = true;
-    setIndex(item.chunk.start);
-    const p = a.play();
-    if (p && p.catch) {
-      p.catch(() => {
-        if (s.dead || s.paused) return;
-        elevenKill();
-        elevenFail('Le navigateur a bloqué la lecture audio. Appuyez sur lecture.');
-      });
-    }
-    elevenPump(s);
-    updateVoiceNote();
-  }
-
-  function elevenEnded(s, item) {
-    if (s.dead) return;
-    setIndex(item.chunk.end);                // recalage : dernier mot de la phrase
-    if (s.active === item) s.active = null;
-    if (item.chunk.end >= state.words.length - 1) { finish(); return; }
-    elevenAdvance(s);
-    elevenPump(s);
-    updateVoiceNote();
-  }
-
-  // À chaque image : le mot affiché est celui que l'horloge de l'audio désigne.
-  function elevenLoop(s) {
-    if (s.dead) return;
-    s.raf = requestAnimationFrame(() => elevenLoop(s));
-    const item = s.active;
-    if (!item || s.paused) return;
-    const k = locateOffset(item.data.wordT, item.el.currentTime);
-    const idx = item.chunk.start + k;
-    if (idx > state.index) setIndex(idx);
-  }
-
-  function elevenPause() {
-    const s = eleven.session;
-    if (!s || s.dead || !(voice.on && isClip())) return false;
-    s.paused = true;
-    if (s.active) s.active.el.pause();
-    return true;
-  }
-
-  function elevenResume() {
-    const s = eleven.session;
-    if (!s || s.dead || !s.paused || !(voice.on && isClip())) return false;
-    s.paused = false;
-    if (s.active) {
-      const p = s.active.el.play();
-      if (p && p.catch) p.catch(() => {});
-    } else {
-      elevenAdvance(s);
-    }
-    elevenPump(s);
-    return true;
-  }
-
-  function elevenKill() {
-    const s = eleven.session;
-    if (!s) return;
-    s.dead = true;
-    eleven.session = null;
-    cancelAnimationFrame(s.raf);
-    try { s.abort.abort(); } catch (e) { /* ignoré */ }
-    for (const a of s.els) {
-      a.onended = null;
-      a.onerror = null;
-      try { a.pause(); a.removeAttribute('src'); a.load(); } catch (e) { /* ignoré */ }
-    }
-  }
-
-  // Changement de vitesse : appliqué tout de suite, sans relancer la phrase.
-  function elevenApplyRate() {
-    elevenRefreshWpm();
-    const s = eleven.session;
-    if (!s) return;
-    const rate = voiceRate();
-    for (const a of s.els) { a.defaultPlaybackRate = rate; a.playbackRate = rate; }
-  }
-
-  function loadVoices() {
-    if (!voice.supported) return;
-    let all = [];
-    try { all = window.speechSynthesis.getVoices() || []; } catch (e) { /* ignoré */ }
-    if (!all.length) return;
-    const isFr = (v) => /^fr([-_]|$)/i.test(v.lang || '');
-    const scored = all.map((v) => ({ v, score: voiceScore(v), fr: isFr(v) }));
-    scored.sort((a, b) =>
-      (Number(b.fr) - Number(a.fr)) ||
-      (b.score - a.score) ||
-      a.v.name.localeCompare(b.v.name));
-    voice.list = scored.map((s) => s.v);
-    voice.best = scored.length && scored[0].fr ? scored[0].score : 0;
-    if (!voice.list.some((v) => voiceId(v) === voice.uri)) {
-      voice.uri = voiceId(scored[0].v);       // meilleure voix française disponible
-    }
-    el.voiceSelect.textContent = '';
-    const groups = [
-      ['Voix naturelles (recommandées)', scored.filter((s) => s.fr && s.score >= NATURAL_SCORE)],
-      ['Autres voix françaises', scored.filter((s) => s.fr && s.score < NATURAL_SCORE)],
-      ['Voix dans d’autres langues', scored.filter((s) => !s.fr)]
-    ];
-    for (const [label, items] of groups) {
-      if (!items.length) continue;
-      const group = document.createElement('optgroup');
-      group.label = label;
-      for (const { v, score } of items) {
-        const opt = document.createElement('option');
-        opt.value = voiceId(v);
-        const flags = [];
-        if (!v.localService) flags.push('en ligne');
-        if (voice.noEventsIds.has(voiceId(v)) || (score < NATURAL_SCORE && /google/i.test(v.name))) flags.push('synchro estimée');
-        opt.textContent = `${v.name} · ${v.lang}${flags.length ? ' · ' + flags.join(', ') : ''}`;
-        group.append(opt);
-      }
-      el.voiceSelect.append(group);
-    }
-    el.voiceSelect.value = voice.uri;
-    updateVoiceNote();
-  }
-
-  /* Note de naturel d'une voix, d'après son nom : les voix neuronales portent
-     presque toujours « Natural », « Neural », « Premium » ou « Enhanced ». */
-  function voiceScore(v) {
-    const name = `${v.name || ''} ${v.voiceURI || ''}`;
-    let s = 0;
-    if (/online \(natural\)|\bnatural\b|\bneural\b/i.test(name)) s += 100;
-    if (/premium|enhanced|améliorée|haute qualité/i.test(name)) s += 90;
-    if (/siri/i.test(name)) s += 60;
-    if (/microsoft/i.test(name) && /online/i.test(name)) s += 10;
-    if (/google/i.test(name)) s += 40;
-    if (/espeak|compact|festival|mbrola/i.test(name)) s -= 60;
-    if (/^fr[-_]fr$/i.test(v.lang || '')) s += 8;
-    else if (/^fr/i.test(v.lang || '')) s += 3;
-    if (v.localService) s += 2;
-    return s;
-  }
-
   /* ---------- Vitesse ---------- */
 
   function setWpm(value, persist = true) {
-    const v = clamp(Math.round(Number(value) / 5) * 5, WPM_MIN, WPM_MAX);
+    // En mode voix, la vitesse est un facteur appliqué à la dictée (×0,5–×2).
+    const lo = voice.on ? VOICE_MIN_WPM : WPM_MIN;
+    const hi = voice.on ? VOICE_MAX_WPM : WPM_MAX;
+    const v = clamp(Math.round(Number(value) / 5) * 5, lo, hi);
     state.wpm = v;
     el.range.value = String(v);
     el.big.textContent = String(v);
@@ -1612,16 +968,28 @@
       b.setAttribute('aria-pressed', String(Number(b.dataset.wpm) === v));
     });
     if (persist) store.set(STORE.wpm, String(v));
-    if (voice.on) {
-      if (isClip()) elevenApplyRate();
-      else if (state.playing) scheduleVoiceRestart();   // la vitesse d'une voix du navigateur ne change pas en cours de phrase
+    updateRateDisplay();
+    if (voice.on && voice.clock) {
+      // Changement de vitesse à chaud : réancrage de l'horloge audio.
+      voice.pos = voiceNow();
+      voice.clock.t0 = voice.ctx.currentTime;
+      voice.clock.anchorPos = voice.pos;
+      voice.clock.rate = voiceRate();
+      if (voice.src) voice.src.playbackRate.value = voice.clock.rate;
     }
     updateProgress();
     updateStats();
-    updateVoiceNote();
   }
 
   /* ---------- Saisie ---------- */
+
+  const SAMPLE_TEXT = [
+    'Longtemps, je me suis couché de bonne heure. Parfois, à peine ma bougie éteinte, mes yeux se fermaient si vite que je n\u2019avais pas le temps de me dire : \u00ab Je m\u2019endors. \u00bb',
+    '',
+    'Et, une demi-heure après, la pensée qu\u2019il était temps de chercher le sommeil m\u2019éveillait ; je voulais poser le volume que je croyais avoir encore entre les mains et souffler ma lumière.',
+    '',
+    'Je n\u2019avais pas cessé en dormant de faire des réflexions sur ce que je venais de lire ; mais ces réflexions avaient pris un tour un peu particulier.'
+  ].join('\n\n');
 
   function updateStats() {
     const tok = getTokens(el.source.value);
@@ -1669,11 +1037,15 @@
       state.loadedText = text;
       state.index = 0;
       state.finished = false;
+      if (voice.on) prepareVoiceText(true);
+    } else if (voice.on && !voice.segs.length) {
+      prepareVoiceText(false);
     }
     rebuildCum();
     buildMarks();
     showView('reader');
     measure();
+    if (voice.on) voice.pos = state.finished ? 0 : timeOfWord(state.index);
     showWord(state.index);
     updateProgress();
     setUiPlaying();
@@ -1683,6 +1055,7 @@
 
   function backToEditor() {
     pause();
+    setVoiceStatus('');
     showView('editor');
     el.source.focus({ preventScroll: true });
   }
@@ -1697,6 +1070,16 @@
 
   el.source.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); startReading(); }
+  });
+
+  el.btnSample.addEventListener('click', () => {
+    if (el.source.value.trim() && el.source.value !== SAMPLE_TEXT
+        && !window.confirm('Remplacer le texte actuel par l\u2019extrait d\u2019exemple ?')) return;
+    el.source.value = SAMPLE_TEXT;
+    store.set(STORE.text, SAMPLE_TEXT);
+    hideError();
+    updateStats();
+    el.source.focus();
   });
 
   el.btnClear.addEventListener('click', () => {
@@ -1734,97 +1117,69 @@
     updateStats();
   });
 
-  el.voiceOn.addEventListener('change', () => {
-    voice.on = el.voiceOn.checked;
-    voice.problem = '';
-    voice.noEvents = false;
-    store.set(STORE.voice, voice.on ? '1' : '0');
-    applyVoiceUi();
-    if (!voice.on) voiceCancel();
-    if (voice.on && voice.engine === 'eleven' && eleven.key && !eleven.found && !eleven.loading) elevenLoadVoices();
-    if (state.playing) {
-      clearTimeout(state.timer);
-      if (voice.on) {
-        voiceStart(state.index);
+  /* Dictée vocale : activation / désactivation, à chaud ou non. */
+  el.optVoice.addEventListener('change', () => {
+    const on = el.optVoice.checked;
+    if (on === voice.on) return;
+    store.set(STORE.voice, on ? '1' : '0');
+    el.voiceSelect.disabled = !on;
+    voice.on = on;
+    setWpm(state.wpm);                      // recadre les bornes (150–600 en voix, 100–1200 sinon)
+    if (on) {
+      if (!el.reader.hidden && state.words.length && !voice.segs.length) prepareVoiceText(false);
+      if (state.playing) {
+        // Bascule à chaud depuis la lecture silencieuse : l'affichage attend
+        // la voix au mot courant, puis la dictée prend la main.
+        clearTimeout(state.timer);
+        state.timer = 0;
+        voice.pos = voice.segs.length ? timeOfWord(state.index) : 0;
+        voice.playing = true;
+        voice.pointer = segOfPos(voice.pos);
+        setUiPlaying();
+        if (!voice.raf) voice.raf = requestAnimationFrame(voiceFrame);
+        if (!startSourceAt(voice.pos)) waitForSegment(voice.pointer);
+      } else if (!el.reader.hidden && voice.segs.length) {
+        voice.pos = timeOfWord(state.index);
+        pump();
       } else {
-        voiceCancel();
-        state.target = performance.now();
+        setVoiceStatus('');
+      }
+    } else {
+      const wasPlaying = voice.playing;
+      stopSource();
+      voice.playing = false;
+      voice.waiting = false;
+      voice.waitSeg = null;
+      if (voice.raf) { cancelAnimationFrame(voice.raf); voice.raf = 0; }
+      setVoiceStatus('');
+      setWpm(state.wpm);                    // rétablit l'affichage « mots / min » simple
+      updateProgress();
+      if (wasPlaying) {
+        // Reprise silencieuse au mot courant.
         state.rampIdx = 1;
+        state.target = performance.now();
         step();
       }
     }
-    updateProgress();
-    updateStats();
   });
 
+  /* Changement de voix : les audio déjà synthétisés correspondent à l'ancienne
+     voix, on repart du mot courant avec la nouvelle. */
   el.voiceSelect.addEventListener('change', () => {
-    voice.uri = el.voiceSelect.value;
-    voice.noEvents = false;
-    voice.effWpm = 0;
-    store.set(STORE.voiceUri, voice.uri);
-    el.voiceSelect.blur();
-    if (voice.on && state.playing) voiceStart(state.index);
-    updateVoiceNote();
-  });
-
-  el.engine.addEventListener('change', () => {
-    voice.engine = el.engine.value === 'browser' ? 'browser' : 'eleven';
-    voice.problem = '';
-    voice.noEvents = false;
-    voice.effWpm = 0;
-    store.set(STORE.engine, voice.engine);
-    voiceCancel();
-    applyVoiceUi();
-    if (voice.engine === 'eleven' && eleven.key && !eleven.found && !eleven.loading) elevenLoadVoices();
-    if (voice.on && state.playing) voiceStart(state.index);
-    el.engine.blur();
-    updateProgress();
-    updateStats();
-  });
-
-  el.elKey.addEventListener('change', () => {
-    eleven.key = el.elKey.value.trim();
-    if (eleven.key) store.set(STORE.elKey, eleven.key);
-    else { try { localStorage.removeItem(STORE.elKey); } catch (e) { /* ignoré */ } }
-    eleven.found = null;
-    voice.problem = '';
-    elevenLoadVoices();
-  });
-
-  const restartIfElevenPlaying = () => {
-    voiceCancel();
-    if (voice.on && voice.engine === 'eleven' && state.playing) voiceStart(state.index);
-  };
-
-  el.elVoice.addEventListener('change', () => {
-    eleven.sel = el.elVoice.value;
-    el.elCustom.hidden = eleven.sel !== 'custom';
-    store.set(STORE.elVoice, eleven.sel);
-    voice.problem = '';
-    el.elVoice.blur();
-    restartIfElevenPlaying();
-    updateVoiceNote();
-  });
-
-  el.elCustom.addEventListener('change', () => {
-    eleven.custom = el.elCustom.value.trim();
-    store.set(STORE.elCustom, eleven.custom);
-    voice.problem = '';
-    restartIfElevenPlaying();
-  });
-
-  el.elRefresh.addEventListener('click', () => {
-    eleven.found = null;
-    voice.problem = '';
-    elevenLoadVoices();
-  });
-
-  // Après un clic souris, une case à cocher ne garde pas le focus : Espace reste « lecture / pause ».
-  el.reader.addEventListener('pointerup', () => {
-    setTimeout(() => {
-      const a = document.activeElement;
-      if (a === el.voiceOn || a === el.pauses) a.blur();
-    }, 0);
+    const id = el.voiceSelect.value;
+    if (!id || id === voice.id) return;
+    voice.id = id;
+    store.set(STORE.voiceId, id);
+    const wasPlaying = voice.playing;
+    stopSource();
+    voice.playing = false;
+    if (voice.raf) { cancelAnimationFrame(voice.raf); voice.raf = 0; }
+    if (voice.segs.length) {
+      prepareVoiceText(false);
+      voice.pos = timeOfWord(state.index);
+    }
+    if (wasPlaying) voicePlay();
+    else { pump(); updateProgress(); }
   });
 
   // Molette sur la scène : ±25 WPM par cran (cumul pour les pavés tactiles).
@@ -1868,11 +1223,10 @@
     if (el.reader.hidden) return;
     const target = e.target;
     const tag = target && target.tagName;
-    if (tag === 'SELECT') return;
-    if (tag === 'INPUT' && (target.type === 'text' || target.type === 'password')) return;   // saisie de la clé API
     if (tag === 'INPUT' && target.type === 'range' && e.key.startsWith('Arrow')) return;
     if (tag === 'INPUT' && target.type === 'checkbox' && e.key === ' ') return;
     if ((tag === 'BUTTON' || tag === 'A') && e.key === ' ') return;   // activation native
+    if (tag === 'SELECT') return;                                    // la voix se règle au clavier
     switch (e.key) {
       case ' ': case 'Spacebar':
         e.preventDefault();
@@ -1926,27 +1280,21 @@
   if (savedText && savedText.trim()) el.source.value = savedText;
   state.pauses = store.get(STORE.pauses) !== '0';
   el.pauses.checked = state.pauses;
-  voice.on = store.get(STORE.voice) === '1';
-  voice.engine = store.get(STORE.engine) === 'browser' ? 'browser' : 'eleven';
-  voice.uri = store.get(STORE.voiceUri) || '';
-  el.voiceOn.checked = voice.on;
-  eleven.key = store.get(STORE.elKey) || '';
-  eleven.sel = store.get(STORE.elVoice) || EL_NAMES[0];
-  eleven.custom = store.get(STORE.elCustom) || '';
-  el.elKey.value = eleven.key;
-  el.elCustom.value = eleven.custom;
-  renderElevenVoices();
-  if (eleven.key && voice.on && voice.engine === 'eleven') elevenLoadVoices();
-  if (voice.supported) {
-    loadVoices();
-    if (typeof window.speechSynthesis.addEventListener === 'function') {
-      window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
-    } else {
-      window.speechSynthesis.onvoiceschanged = loadVoices;
-    }
-    setTimeout(loadVoices, 600);       // certains navigateurs n'émettent pas voiceschanged
+
+  // Voix : options peuplées, choix persisté.
+  for (const v of VOICES) {
+    const opt = document.createElement('option');
+    opt.value = v.id;
+    opt.textContent = v.label;
+    el.voiceSelect.append(opt);
   }
-  applyVoiceUi();
+  const savedVoiceId = store.get(STORE.voiceId);
+  if (savedVoiceId && VOICES.some((v) => v.id === savedVoiceId)) voice.id = savedVoiceId;
+  el.voiceSelect.value = voice.id;
+  voice.on = store.get(STORE.voice) === '1';
+  el.optVoice.checked = voice.on;
+  el.voiceSelect.disabled = !voice.on;
+
   const savedWpm = Number(store.get(STORE.wpm));
   setWpm(savedWpm >= WPM_MIN && savedWpm <= WPM_MAX ? savedWpm : 300, false);
   updateStats();
